@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 # Configuração da página
 st.set_page_config(page_title="Controle de Mercadorias", layout="wide")
 
-# CSS personalizado ajustado para corresponder à imagem
+# CSS personalizado (mantido igual ao original)
 st.markdown(
     """
     <style>
@@ -208,6 +208,21 @@ def inserir_registro_manual():
                         )
                         return
                 
+                # Validar se há estoque suficiente para saídas
+                if tipo == "saída":
+                    saldo_atual = calcular_saldo(st.session_state.df)
+                    if produto in saldo_atual.index:
+                        saldo_qty = saldo_atual.loc[produto, "Saldo Atual"]
+                        if quantidade > saldo_qty:
+                            st.error(
+                                f"Estoque insuficiente para o produto '{produto}'. "
+                                f"Saldo atual: {saldo_qty}, Quantidade solicitada: {quantidade}."
+                            )
+                            return
+                    else:
+                        st.error(f"O produto '{produto}' não possui entradas registradas.")
+                        return
+                
                 registro = {
                     "Data": data_registro,
                     "Produto": produto,
@@ -239,6 +254,7 @@ def calcular_saldo(df):
     try:
         logger.info("Iniciando cálculo do saldo")
         
+        # Verificar saídas inválidas
         saidas_invalidas = df[(df["Tipo"] == "saída") & (df["Preço de Venda"] <= 0)]
         if not saidas_invalidas.empty:
             st.warning(
@@ -246,24 +262,29 @@ def calcular_saldo(df):
                 "Por favor, corrija os registros para cálculos precisos."
             )
         
+        # Calcular quantidades de entradas e saídas
         entradas_qty = df[df["Tipo"] == "entrada"].groupby("Produto")["Quantidade"].sum()
         saidas_qty = df[df["Tipo"] == "saída"].groupby("Produto")["Quantidade"].sum()
         saldo_qty = entradas_qty.subtract(saidas_qty, fill_value=0)
         
+        # Calcular valores de entradas
         df_entradas = df[df["Tipo"] == "entrada"].copy()
         df_entradas["Valor Entradas"] = df_entradas["Quantidade"] * df_entradas["Custo Unitário"]
         entradas_valor = df_entradas.groupby("Produto")["Valor Entradas"].sum()
         
+        # Calcular valores de saídas
         df_saidas = df[df["Tipo"] == "saída"].copy()
         df_saidas["Valor Saídas"] = df_saidas["Quantidade"] * df_saidas["Preço de Venda"]
         saidas_valor = df_saidas.groupby("Produto")["Valor Saídas"].sum()
         
+        # Calcular custo médio e lucro
         custo_medio = df[df["Tipo"] == "entrada"].groupby("Produto")["Custo Unitário"].mean()
         df_saidas = df_saidas.join(custo_medio.rename("Custo Médio"), on="Produto")
         df_saidas["Custo Médio"] = df_saidas["Custo Médio"].fillna(0.0)
         df_saidas["Lucro"] = df_saidas["Quantidade"] * (df_saidas["Preço de Venda"] - df_saidas["Custo Médio"])
         lucro = df_saidas.groupby("Produto")["Lucro"].sum().fillna(0)
         
+        # Criar DataFrame de saldo
         saldo = pd.DataFrame({
             "Entradas": entradas_qty,
             "Saídas": saidas_qty,
@@ -273,6 +294,7 @@ def calcular_saldo(df):
             "Lucro": lucro
         }).fillna(0)
         
+        # Formatar valores monetários
         saldo["Valor Entradas"] = saldo["Valor Entradas"].apply(lambda x: f"R$ {x:,.2f}")
         saldo["Valor Saídas"] = saldo["Valor Saídas"].apply(lambda x: f"R$ {x:,.2f}")
         saldo["Lucro"] = saldo["Lucro"].apply(lambda x: f"R$ {x:,.2f}")
@@ -349,6 +371,9 @@ def grafico_linha_evolucao(produto, df_produto, agregacao="Diária"):
     elif agregacao == "Mensal":
         df_resumo["Data"] = df_resumo["Data"].dt.to_period("M").apply(lambda r: r.start_time)
     
+    df_resumo["Quantidade"] = df_resumo.apply(
+        lambda row: row["Quantidade"] if row["Tipo"] == "entrada" else -row["Quantidade"], axis=1
+    )
     df_resumo = df_resumo.groupby(["Data", "Tipo"])["Quantidade"].sum().reset_index()
     fig = px.line(
         df_resumo,
@@ -519,19 +544,27 @@ def configurar_analise_detalhada():
     return produto_escolhido, agregacao
 
 def aggregate_movimentacoes(df):
-    """Agrega os dados de movimentações por Produto e Custo Unitário, somando a Quantidade."""
+    """Agrega os dados de movimentações por Produto, Tipo e Custo Unitário, tratando saídas corretamente."""
     if df.empty:
         return df
     
-    # Agrupar por Produto e Custo Unitário
-    grouped = df.groupby(["Produto", "Custo Unitário"]).agg({
-        "Quantidade": "sum",  # Somar a quantidade
-        "Data": "max",        # Pegar a data mais recente
-        "Tipo": "last",       # Pegar o último tipo (entrada/saída)
-        "Preço de Venda": "last"  # Pegar o último preço de venda
+    # Ajustar quantidades para saídas (negativas)
+    df = df.copy()
+    df["Quantidade Ajustada"] = df.apply(
+        lambda row: row["Quantidade"] if row["Tipo"] == "entrada" else -row["Quantidade"], axis=1
+    )
+    
+    # Agrupar por Produto, Tipo e Custo Unitário
+    grouped = df.groupby(["Produto", "Tipo", "Custo Unitário"]).agg({
+        "Quantidade Ajustada": "sum",  # Somar quantidades ajustadas
+        "Data": "max",                 # Pegar a data mais recente
+        "Preço de Venda": "last"       # Pegar o último preço de venda
     }).reset_index()
     
-    # Reordenar as colunas para manter o formato original
+    # Renomear coluna para manter consistência
+    grouped = grouped.rename(columns={"Quantidade Ajustada": "Quantidade"})
+    
+    # Reordenar colunas
     return grouped[["Data", "Produto", "Tipo", "Quantidade", "Custo Unitário", "Preço de Venda"]]
 
 def exibir_dados_movimentacoes(df):
@@ -582,6 +615,7 @@ def exibir_resumo_estoque(df_filtrado):
     with col_chart2:
         grafico_barra_valor(saldo)
     
+    # Cálculos globais
     total_entradas_qty = df_filtrado[df_filtrado["Tipo"]=="entrada"]["Quantidade"].sum()
     total_saidas_qty = df_filtrado[df_filtrado["Tipo"]=="saída"]["Quantidade"].sum()
     total_valor_entradas = (
@@ -593,6 +627,7 @@ def exibir_resumo_estoque(df_filtrado):
         df_filtrado[df_filtrado["Tipo"]=="saída"]["Preço de Venda"]
     ).sum()
     
+    # Cálculo do lucro global
     df_saidas = df_filtrado[df_filtrado["Tipo"] == "saída"].copy()
     custo_medio = df_filtrado[df_filtrado["Tipo"] == "entrada"].groupby("Produto")["Custo Unitário"].mean()
     df_saidas = df_saidas.join(custo_medio.rename("Custo Médio"), on="Produto")
